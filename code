@@ -1,0 +1,566 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  View, Text, ScrollView, TouchableOpacity, TextInput,
+  Modal, Alert, RefreshControl, ActivityIndicator,
+  StyleSheet, SafeAreaView, StatusBar, Platform, Dimensions,
+  KeyboardAvoidingView, FlatList,
+} from 'react-native';
+
+const W = Dimensions.get('window').width;
+
+// ─── THEME ────────────────────────────────────────────────────────────────────
+const C = {
+  bg0:'#0a0a0f', bg1:'#12121a', bg2:'#1a1a26', bg3:'#22223a',
+  accent:'#00e5a0', red:'#ff4d6d', amber:'#f5a623', blue:'#4a9eff',
+  t1:'#f0f0f8', t2:'#9090b0', t3:'#505070',
+  border:'#2a2a40', success:'#00c87a', danger:'#ff3355',
+};
+
+// ─── STORAGE (AsyncStorage shim using in-memory for Expo Go compat) ───────────
+const store = {};
+const Storage = {
+  get: async k => store[k] ?? null,
+  set: async (k,v) => { store[k]=v; },
+};
+
+// ─── DEFAULT DATA ──────────────────────────────────────────────────────────────
+const DEFAULT_TICKERS = ['ES=F','NQ=F','NVDA','AVGO','INTC','RKLB','MU','MELI','CAT','PANW','HOOD'];
+const DEFAULT_RECS = [
+  {id:1,sym:'NVDA',name:'Nvidia',action:'BUY',target:'$185',reason:'Multiple Wall Street banks raised price targets after Blackwell shipment expansion. Analysts model a steep revenue ramp into Q4.',chg:'+1.2%',up:true},
+  {id:2,sym:'MSFT',name:'Microsoft',action:'BUY',target:'$510',reason:'Sell-side models catching up to Azure run rate. AI-driven cloud growth re-accelerating at a reasonable valuation.',chg:'+0.5%',up:true},
+  {id:3,sym:'INTC',name:'Intel',action:'BUY',target:'$52',reason:'Major analyst upgrade wave after 250% YTD move. Foundry customer wins keep landing. Asymmetric upside if Intel regains share.',chg:'+0.9%',up:true},
+  {id:4,sym:'RKLB',name:'Rocket Lab',action:'BUY',target:'$38',reason:'Two analyst upgrades after Neutron development update pulled forward launch window. Sell-side now re-rating.',chg:'+2.1%',up:true},
+  {id:5,sym:'MU',name:'Micron',action:'BUY',target:'$145',reason:'46-analyst consensus Buy. Strong HBM4E AI memory demand. Well-positioned in the AI server memory race.',chg:'+0.7%',up:true},
+  {id:6,sym:'CAT',name:'Caterpillar',action:'SELL',target:'$240',reason:'Analysts flag ~309% overvaluation vs fair value ~$240. 176% 1-year run already priced in.',chg:'+1.1%',up:true},
+  {id:7,sym:'PANW',name:'Palo Alto Networks',action:'SELL',target:'N/A',reason:'Morningstar flagged as overvalued in June. Stretched valuation; cyber competitive dynamics intensifying.',chg:'-0.4%',up:false},
+  {id:8,sym:'HOOD',name:'Robinhood',action:'WATCH',target:'$28',reason:'Two new Buy initiations after May\'s strongest retail engagement in years. Enter on dips, not at highs.',chg:'+3.2%',up:true},
+];
+const CF_OPTIONS = ['Trend','Momentum','Order Flow','Key Levels','News Bias','Volume','Revert'];
+const FACTORS = [
+  {name:'News & macro', color:'#4a9eff'},
+  {name:'Trend/structure', color:'#00e5a0'},
+  {name:'Order flow', color:'#f5a623'},
+  {name:'Key levels', color:'#d4537e'},
+];
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+const fmtPrice = p => {
+  if (!p && p!==0) return '--';
+  if (p>=10000) return p.toLocaleString('en-US',{maximumFractionDigits:0});
+  return p.toFixed(2);
+};
+const fmtMoney = v => '$'+Math.abs(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+async function fetchPrice(sym) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=2d`;
+    const r = await fetch(url);
+    const d = await r.json();
+    const meta = d.chart.result[0].meta;
+    const price = meta.regularMarketPrice;
+    const prev = meta.chartPreviousClose || meta.previousClose;
+    const chg = prev ? ((price-prev)/prev*100) : 0;
+    return {price, chg, up: chg>=0};
+  } catch { return null; }
+}
+
+// ─── COMPONENTS ───────────────────────────────────────────────────────────────
+const Badge = ({action}) => {
+  const colors = {BUY:{bg:'rgba(0,200,122,.15)',t:C.success},SELL:{bg:'rgba(255,51,85,.15)',t:C.danger},WATCH:{bg:'rgba(245,166,35,.15)',t:C.amber}};
+  const s = colors[action]||colors.WATCH;
+  return <View style={{backgroundColor:s.bg,borderRadius:20,paddingHorizontal:10,paddingVertical:3}}>
+    <Text style={{color:s.t,fontSize:10,fontWeight:'700'}}>{action}</Text>
+  </View>;
+};
+
+const SectionTitle = ({children}) => (
+  <Text style={{color:C.t2,fontSize:10,fontWeight:'700',textTransform:'uppercase',letterSpacing:.8,marginBottom:8}}>{children}</Text>
+);
+
+const Card = ({children, style}) => (
+  <View style={[{backgroundColor:C.bg1,borderColor:C.border,borderWidth:1,borderRadius:14,padding:14,marginBottom:10},style]}>
+    {children}
+  </View>
+);
+
+// ─── DASHBOARD TAB ────────────────────────────────────────────────────────────
+function DashboardTab({tickers, tickerData, onAddTicker, onRemoveTicker, activeCF, onToggleCF}) {
+  const n = activeCF.size;
+  const score = Math.min(95, 40+n*9);
+  const longPct = Math.min(90, 50+n*4);
+  const conf = score>=75?'High':score>=55?'Medium':'Low';
+  const edge = (2+n*.4).toFixed(1);
+  const rr = (1.5+n*.2).toFixed(1);
+  const circ = 2*Math.PI*44;
+  const offset = circ-(score/100)*circ;
+
+  return (
+    <ScrollView style={s.scroll} showsVerticalScrollIndicator={false}>
+      {/* TICKER */}
+      <Card>
+        <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+          <SectionTitle>Live market</SectionTitle>
+          <TouchableOpacity onPress={onAddTicker}>
+            <Text style={{color:C.accent,fontSize:12}}>+ Add</Text>
+          </TouchableOpacity>
+        </View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          {tickers.map(sym => {
+            const d = tickerData[sym];
+            const disp = sym.replace('=F','');
+            return (
+              <TouchableOpacity key={sym} onLongPress={()=>onRemoveTicker(sym)}
+                style={{backgroundColor:C.bg2,borderColor:C.border,borderWidth:1,borderRadius:10,padding:10,marginRight:8,minWidth:90}}>
+                <Text style={{color:C.t2,fontSize:10,fontWeight:'600',marginBottom:2}}>{disp}</Text>
+                <Text style={{color:C.t1,fontSize:14,fontWeight:'700'}}>{d?`$${fmtPrice(d.price)}`:'...'}</Text>
+                {d && <Text style={{color:d.up?C.success:C.danger,fontSize:10,marginTop:2}}>{d.up?'+':''}{d.chg.toFixed(2)}%</Text>}
+              </TouchableOpacity>
+            );
+          })}
+        </ScrollView>
+        <Text style={{color:C.t3,fontSize:9,textAlign:'right',marginTop:6}}>Long-press ticker to remove · refreshes every 30s</Text>
+      </Card>
+
+      {/* CONFLUENCE */}
+      <Card>
+        <SectionTitle>Confluence setup</SectionTitle>
+        <View style={{flexDirection:'row',flexWrap:'wrap',gap:6}}>
+          {CF_OPTIONS.map(o => (
+            <TouchableOpacity key={o} onPress={()=>onToggleCF(o)}
+              style={{paddingHorizontal:12,paddingVertical:5,borderRadius:20,borderWidth:1,
+                borderColor:activeCF.has(o)?C.accent:C.border,
+                backgroundColor:activeCF.has(o)?'rgba(0,229,160,.1)':C.bg2}}>
+              <Text style={{color:activeCF.has(o)?C.accent:C.t2,fontSize:11}}>{o}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      </Card>
+
+      {/* SIGNAL */}
+      <Card>
+        <SectionTitle>Signal strength</SectionTitle>
+        <View style={{flexDirection:'row',alignItems:'center',gap:16}}>
+          <View style={{width:88,height:88}}>
+            <View style={{position:'absolute',top:0,left:0,width:88,height:88,alignItems:'center',justifyContent:'center'}}>
+              <Text style={{color:C.t1,fontSize:18,fontWeight:'700'}}>{score}%</Text>
+            </View>
+          </View>
+          <View style={{flex:1}}>
+            <View style={{flexDirection:'row',gap:6,marginBottom:8}}>
+              <View style={{backgroundColor:'rgba(0,200,122,.15)',borderRadius:20,paddingHorizontal:10,paddingVertical:4}}>
+                <Text style={{color:C.success,fontSize:11,fontWeight:'600'}}>Long {longPct}%</Text>
+              </View>
+              <View style={{backgroundColor:'rgba(255,51,85,.15)',borderRadius:20,paddingHorizontal:10,paddingVertical:4}}>
+                <Text style={{color:C.danger,fontSize:11,fontWeight:'600'}}>Short {100-longPct}%</Text>
+              </View>
+            </View>
+            <Text style={{color:C.t2,fontSize:12,lineHeight:20}}>
+              Confidence: <Text style={{color:C.t1,fontWeight:'600'}}>{conf}</Text>{'\n'}
+              Edge: <Text style={{color:C.t1,fontWeight:'600'}}>+{edge}%</Text>{'\n'}
+              R:R Ratio: <Text style={{color:C.t1,fontWeight:'600'}}>1:{rr}</Text>
+            </Text>
+          </View>
+        </View>
+      </Card>
+
+      {/* FACTORS */}
+      <Card>
+        <SectionTitle>Factor breakdown</SectionTitle>
+        {FACTORS.map((f,i) => {
+          const pct = Math.min(100, Math.round(40+i*7+n*5));
+          return (
+            <View key={f.name} style={{flexDirection:'row',alignItems:'center',gap:8,marginBottom:8}}>
+              <Text style={{color:C.t2,fontSize:11,width:100}}>{f.name}</Text>
+              <View style={{flex:1,height:4,backgroundColor:C.bg3,borderRadius:2}}>
+                <View style={{width:`${pct}%`,height:4,backgroundColor:f.color,borderRadius:2}}/>
+              </View>
+              <Text style={{color:C.t1,fontSize:10,fontWeight:'600',width:30,textAlign:'right'}}>{pct}%</Text>
+            </View>
+          );
+        })}
+      </Card>
+      <Text style={s.disclaimer}>⚠️ For educational purposes only. Not financial advice.</Text>
+    </ScrollView>
+  );
+}
+
+// ─── PICKS TAB ────────────────────────────────────────────────────────────────
+function PicksTab({recs, tickerData, onAdd, onEdit, onDelete}) {
+  return (
+    <ScrollView style={s.scroll} showsVerticalScrollIndicator={false}>
+      <TouchableOpacity onPress={onAdd} style={{flexDirection:'row',alignItems:'center',gap:4,marginBottom:8}}>
+        <Text style={{color:C.accent,fontSize:12}}>+ Add recommendation</Text>
+      </TouchableOpacity>
+      {recs.map(r => {
+        const live = tickerData[r.sym];
+        const chg = live ? (live.up?'+':'')+live.chg.toFixed(2)+'%' : r.chg;
+        const up = live ? live.up : r.up;
+        return (
+          <Card key={r.id}>
+            <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+              <View>
+                <Text style={{color:C.t1,fontSize:15,fontWeight:'700'}}>{r.sym}</Text>
+                <Text style={{color:C.t2,fontSize:10,marginTop:1}}>{r.name}</Text>
+              </View>
+              <Badge action={r.action}/>
+            </View>
+            <View style={{flexDirection:'row',gap:12,marginBottom:6}}>
+              <Text style={{color:up?C.success:C.danger,fontSize:11,fontWeight:'600'}}>{chg}</Text>
+              {r.target&&r.target!=='N/A'&&<Text style={{color:C.t2,fontSize:11}}>Target: <Text style={{color:C.t1}}>{r.target}</Text></Text>}
+            </View>
+            <Text style={{color:C.t2,fontSize:11,lineHeight:17,marginBottom:8}}>{r.reason}</Text>
+            <View style={{flexDirection:'row',gap:8}}>
+              <TouchableOpacity onPress={()=>onEdit(r)} style={s.recBtn}>
+                <Text style={{color:C.t2,fontSize:11}}>Edit</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={()=>onDelete(r.id)} style={s.recBtn}>
+                <Text style={{color:C.danger,fontSize:11}}>Delete</Text>
+              </TouchableOpacity>
+            </View>
+          </Card>
+        );
+      })}
+      <Text style={s.disclaimer}>⚠️ Not financial advice. Do your own research.</Text>
+    </ScrollView>
+  );
+}
+
+// ─── PORTFOLIO TAB ────────────────────────────────────────────────────────────
+function PortfolioTab({portfolio, tickerData, onAdd, onRemove}) {
+  let totalVal=0, totalCost=0;
+  portfolio.forEach(p => {
+    const cur = tickerData[p.sym]?.price ?? p.buyPrice;
+    totalVal += p.shares*cur;
+    totalCost += p.shares*p.buyPrice;
+  });
+  const totalPnl = totalVal-totalCost;
+  const totalPct = totalCost ? totalPnl/totalCost*100 : 0;
+
+  return (
+    <ScrollView style={s.scroll} showsVerticalScrollIndicator={false}>
+      <View style={{flexDirection:'row',gap:8,marginBottom:10}}>
+        {[
+          {label:'Total value', val:fmtMoney(totalVal), sub:(totalPnl>=0?'+':'')+fmtMoney(totalPnl)+' ('+totalPct.toFixed(1)+'%)', color:totalPnl>=0?C.success:C.danger},
+          {label:'Positions', val:String(portfolio.length), sub:'holdings', color:C.t2},
+        ].map(c => (
+          <View key={c.label} style={{flex:1,backgroundColor:C.bg2,borderRadius:10,padding:12}}>
+            <Text style={{color:C.t2,fontSize:10,marginBottom:3}}>{c.label}</Text>
+            <Text style={{color:C.t1,fontSize:20,fontWeight:'700'}}>{c.val}</Text>
+            <Text style={{color:c.color,fontSize:10,marginTop:2}}>{c.sub}</Text>
+          </View>
+        ))}
+      </View>
+      <TouchableOpacity onPress={onAdd} style={{flexDirection:'row',alignItems:'center',gap:4,marginBottom:8}}>
+        <Text style={{color:C.accent,fontSize:12}}>+ Add position</Text>
+      </TouchableOpacity>
+      {portfolio.length===0 && <Text style={{color:C.t3,fontSize:12,textAlign:'center',paddingVertical:30}}>No positions yet. Tap + Add position.</Text>}
+      {portfolio.map(p => {
+        const live = tickerData[p.sym];
+        const cur = live?.price ?? p.buyPrice;
+        const val = p.shares*cur;
+        const cost = p.shares*p.buyPrice;
+        const pnl = val-cost;
+        const pct = cost ? pnl/cost*100 : 0;
+        return (
+          <Card key={p.id}>
+            <View style={{flexDirection:'row',alignItems:'center',gap:10}}>
+              <View style={{width:44,height:44,borderRadius:22,backgroundColor:C.bg3,alignItems:'center',justifyContent:'center'}}>
+                <Text style={{color:C.accent,fontSize:12,fontWeight:'700'}}>{p.sym.slice(0,3)}</Text>
+              </View>
+              <View style={{flex:1}}>
+                <Text style={{color:C.t1,fontSize:14,fontWeight:'700'}}>{p.sym}</Text>
+                <Text style={{color:C.t2,fontSize:10}}>{p.shares} shares @ ${p.buyPrice.toFixed(2)}</Text>
+                {live && <Text style={{color:C.t3,fontSize:10}}>Live: ${fmtPrice(cur)}</Text>}
+              </View>
+              <View style={{alignItems:'flex-end'}}>
+                <Text style={{color:C.t1,fontSize:14,fontWeight:'700'}}>{fmtMoney(val)}</Text>
+                <Text style={{color:pnl>=0?C.success:C.danger,fontSize:11}}>{pnl>=0?'+':''}{fmtMoney(pnl)} ({pct>=0?'+':''}{pct.toFixed(1)}%)</Text>
+              </View>
+              <TouchableOpacity onPress={()=>onRemove(p.id)} style={{paddingLeft:8}}>
+                <Text style={{color:C.t3,fontSize:18}}>×</Text>
+              </TouchableOpacity>
+            </View>
+          </Card>
+        );
+      })}
+      <Text style={s.disclaimer}>⚠️ Portfolio tracking is approximate. Prices may be delayed.</Text>
+    </ScrollView>
+  );
+}
+
+// ─── AI TAB ───────────────────────────────────────────────────────────────────
+function AITab({activeCF, recs, portfolio}) {
+  const [out, setOut] = useState('Tap "Generate analysis" for a personalised AI trade plan based on your setup, picks, and portfolio.');
+  const [loading, setLoading] = useState(false);
+
+  const generate = async () => {
+    setLoading(true);
+    setOut('Analysing your setup...');
+    const cfList = [...activeCF].join(', ')||'none';
+    const portStr = portfolio.length ? portfolio.map(p=>`${p.sym} (${p.shares} shares @ $${p.buyPrice})`).join(', ') : 'No positions';
+    const buys = recs.filter(r=>r.action==='BUY').map(r=>r.sym).join(', ');
+    const sells = recs.filter(r=>r.action==='SELL').map(r=>r.sym).join(', ');
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          model:'claude-sonnet-4-6', max_tokens:1000,
+          messages:[{role:'user',content:`You are a professional trading analyst. Date: June 20, 2026.
+
+MARKET: Markets up 0.9% this week. Tech leading. Small caps outperforming. Energy lagging. Risk-on. NVDA Blackwell expansion bullish. Azure re-accelerating. Iran deal minimal impact.
+
+USER SETUP:
+- Active confluences: ${cfList}
+- Portfolio: ${portStr}
+- BUY picks: ${buys}
+- SELL picks: ${sells}
+
+Write a concise, specific 4-5 sentence personalised game plan for today. Reference their actual positions and picks. Be direct and professional. No disclaimers.`}]
+        })
+      });
+      const data = await res.json();
+      const text = data.content?.map(c=>c.text||'').join('')||'Unable to generate analysis.';
+      setOut(text);
+    } catch {
+      setOut('Error connecting to AI. Check your internet connection and try again.');
+    }
+    setLoading(false);
+  };
+
+  return (
+    <ScrollView style={s.scroll} showsVerticalScrollIndicator={false}>
+      <Card>
+        <Text style={{color:C.accent,fontSize:13,fontWeight:'700',marginBottom:10}}>⚡ AI Trade Analysis</Text>
+        <Text style={{color:C.t2,fontSize:12,lineHeight:20,marginBottom:12}}>{out}</Text>
+        <TouchableOpacity onPress={generate} disabled={loading}
+          style={{backgroundColor:'rgba(0,229,160,.1)',borderColor:C.accent,borderWidth:1,borderRadius:10,padding:12,alignItems:'center'}}>
+          {loading ? <ActivityIndicator color={C.accent}/> : <Text style={{color:C.accent,fontSize:13,fontWeight:'700'}}>Generate analysis</Text>}
+        </TouchableOpacity>
+      </Card>
+      <Card>
+        <Text style={{color:C.accent,fontSize:13,fontWeight:'700',marginBottom:10}}>📈 Market context</Text>
+        <Text style={{color:C.t2,fontSize:11,lineHeight:18}}>
+          <Text style={{color:C.t1,fontWeight:'600'}}>Week ending Jun 20, 2026:{'\n'}</Text>
+          Markets up 0.9% — tech and growth reclaiming leadership. Small caps & microcaps outperformed. Risk-on sentiment with flows into high-beta, momentum, and growth.{'\n\n'}
+          <Text style={{color:C.t1,fontWeight:'600'}}>Sectors:{'\n'}</Text>
+          Tech ▲  Energy ▼  Value ▼  Blockchain ▲{'\n\n'}
+          <Text style={{color:C.t1,fontWeight:'600'}}>Key events:{'\n'}</Text>
+          Iran deal had limited market impact. Broadcom led Mag 7+. NVDA Blackwell shipment expansion. Azure run rate re-accelerating. INTC upgrade wave after 250% YTD.
+        </Text>
+      </Card>
+    </ScrollView>
+  );
+}
+
+// ─── MODAL ────────────────────────────────────────────────────────────────────
+function AppModal({visible, title, onClose, children}) {
+  return (
+    <Modal visible={visible} animationType="slide" transparent>
+      <KeyboardAvoidingView behavior={Platform.OS==='ios'?'padding':'height'} style={{flex:1,justifyContent:'flex-end'}}>
+        <View style={{backgroundColor:C.bg1,borderTopLeftRadius:20,borderTopRightRadius:20,padding:20,borderTopWidth:1,borderColor:C.border}}>
+          <Text style={{color:C.t1,fontSize:15,fontWeight:'700',marginBottom:14}}>{title}</Text>
+          {children}
+          <TouchableOpacity onPress={onClose} style={{alignItems:'center',paddingVertical:12,marginTop:4}}>
+            <Text style={{color:C.t2,fontSize:13}}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+const Inp = (props) => (
+  <TextInput placeholderTextColor={C.t3} style={{
+    backgroundColor:C.bg2,borderColor:C.border,borderWidth:1,borderRadius:10,
+    padding:12,color:C.t1,fontSize:14,marginBottom:10,fontFamily:Platform.OS==='ios'?'Menlo':'monospace'
+  }} {...props}/>
+);
+
+const BtnPrimary = ({title, onPress}) => (
+  <TouchableOpacity onPress={onPress} style={{backgroundColor:C.accent,borderRadius:10,padding:13,alignItems:'center',marginTop:4}}>
+    <Text style={{color:'#000',fontSize:14,fontWeight:'700'}}>{title}</Text>
+  </TouchableOpacity>
+);
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [tickers, setTickers] = useState(DEFAULT_TICKERS);
+  const [tickerData, setTickerData] = useState({});
+  const [activeCF, setActiveCF] = useState(new Set(['Trend','Momentum','Order Flow']));
+  const [recs, setRecs] = useState(DEFAULT_RECS);
+  const [portfolio, setPortfolio] = useState([]);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // modals
+  const [tickerModal, setTickerModal] = useState(false);
+  const [recModal, setRecModal] = useState(false);
+  const [posModal, setPosModal] = useState(false);
+  const [newTickerSym, setNewTickerSym] = useState('');
+  const [editingRec, setEditingRec] = useState(null);
+  const [recForm, setRecForm] = useState({sym:'',name:'',action:'BUY',target:'',reason:''});
+  const [posForm, setPosForm] = useState({sym:'',shares:'',buyPrice:''});
+  const [nextId, setNextId] = useState(9);
+
+  // load saved data
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await Storage.get('recs'); if(r) setRecs(JSON.parse(r));
+        const p = await Storage.get('portfolio'); if(p) setPortfolio(JSON.parse(p));
+        const t = await Storage.get('tickers'); if(t) setTickers(JSON.parse(t));
+        const n = await Storage.get('nextId'); if(n) setNextId(parseInt(n));
+      } catch {}
+    })();
+  }, []);
+
+  const save = useCallback(async (r,p,t,n) => {
+    await Storage.set('recs',JSON.stringify(r));
+    await Storage.set('portfolio',JSON.stringify(p));
+    await Storage.set('tickers',JSON.stringify(t));
+    await Storage.set('nextId',String(n));
+  },[]);
+
+  // fetch prices
+  const refreshAll = useCallback(async () => {
+    const results = {};
+    await Promise.all(tickers.map(async sym => {
+      const d = await fetchPrice(sym); if(d) results[sym]=d;
+    }));
+    setTickerData(prev=>({...prev,...results}));
+  },[tickers]);
+
+  useEffect(() => { refreshAll(); const t=setInterval(refreshAll,30000); return ()=>clearInterval(t); },[refreshAll]);
+
+  const onRefresh = async () => { setRefreshing(true); await refreshAll(); setRefreshing(false); };
+
+  const toggleCF = (o) => setActiveCF(prev => { const n=new Set(prev); n.has(o)?n.delete(o):n.add(o); return n; });
+
+  // ticker actions
+  const addTicker = () => {
+    const sym = newTickerSym.trim().toUpperCase();
+    if(!sym||tickers.includes(sym)) { setTickerModal(false); return; }
+    const t = [...tickers,sym]; setTickers(t); setTickerModal(false); setNewTickerSym('');
+    fetchPrice(sym).then(d=>{ if(d) setTickerData(p=>({...p,[sym]:d})); });
+    save(recs,portfolio,t,nextId);
+  };
+  const removeTicker = (sym) => {
+    Alert.alert('Remove '+sym,'Remove this ticker?',[
+      {text:'Cancel',style:'cancel'},
+      {text:'Remove',style:'destructive',onPress:()=>{ const t=tickers.filter(s=>s!==sym); setTickers(t); save(recs,portfolio,t,nextId); }}
+    ]);
+  };
+
+  // rec actions
+  const openAddRec = () => { setEditingRec(null); setRecForm({sym:'',name:'',action:'BUY',target:'',reason:''}); setRecModal(true); };
+  const openEditRec = (r) => { setEditingRec(r.id); setRecForm({sym:r.sym,name:r.name,action:r.action,target:r.target||'',reason:r.reason}); setRecModal(true); };
+  const saveRec = () => {
+    if(!recForm.sym||!recForm.reason) return;
+    let r;
+    if(editingRec) { r=recs.map(x=>x.id===editingRec?{...x,...recForm}:x); }
+    else { r=[...recs,{...recForm,id:nextId,chg:'—',up:true}]; setNextId(n=>{const nn=n+1;return nn;}); }
+    setRecs(r); setRecModal(false); save(r,portfolio,tickers,nextId+1);
+  };
+  const deleteRec = (id) => {
+    Alert.alert('Delete','Remove this recommendation?',[
+      {text:'Cancel',style:'cancel'},
+      {text:'Delete',style:'destructive',onPress:()=>{ const r=recs.filter(x=>x.id!==id); setRecs(r); save(r,portfolio,tickers,nextId); }}
+    ]);
+  };
+
+  // portfolio actions
+  const addPosition = () => {
+    const sym=posForm.sym.trim().toUpperCase();
+    const shares=parseFloat(posForm.shares);
+    const buyPrice=parseFloat(posForm.buyPrice);
+    if(!sym||!shares||!buyPrice) return;
+    const p=[...portfolio,{sym,shares,buyPrice,id:Date.now()}];
+    setPortfolio(p); setPosModal(false); setPosForm({sym:'',shares:'',buyPrice:''});
+    save(recs,p,tickers,nextId);
+    if(!tickers.includes(sym)) { const t=[...tickers,sym]; setTickers(t); fetchPrice(sym).then(d=>{if(d) setTickerData(prev=>({...prev,[sym]:d}));}); }
+  };
+  const removePosition = (id) => {
+    Alert.alert('Remove position','Delete this holding?',[
+      {text:'Cancel',style:'cancel'},
+      {text:'Remove',style:'destructive',onPress:()=>{ const p=portfolio.filter(x=>x.id!==id); setPortfolio(p); save(recs,p,tickers,nextId); }}
+    ]);
+  };
+
+  const TABS = [{id:'dashboard',label:'Dashboard'},{id:'picks',label:'Picks'},{id:'portfolio',label:'Portfolio'},{id:'ai',label:'AI'}];
+
+  return (
+    <SafeAreaView style={{flex:1,backgroundColor:C.bg0}}>
+      <StatusBar barStyle="light-content" backgroundColor={C.bg0}/>
+
+      {/* HEADER */}
+      <View style={{flexDirection:'row',justifyContent:'space-between',alignItems:'center',paddingHorizontal:16,paddingVertical:10,borderBottomWidth:1,borderColor:C.border,backgroundColor:C.bg0}}>
+        <Text style={{fontSize:18,fontWeight:'700',color:C.t1,letterSpacing:-.5}}>Signal<Text style={{color:C.accent}}>Pro</Text></Text>
+        <View style={{flexDirection:'row',alignItems:'center',gap:5}}>
+          <View style={{width:6,height:6,borderRadius:3,backgroundColor:C.accent}}/>
+          <Text style={{color:C.t2,fontSize:11}}>{new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</Text>
+        </View>
+      </View>
+
+      {/* TABS */}
+      <View style={{flexDirection:'row',borderBottomWidth:1,borderColor:C.border,backgroundColor:C.bg1}}>
+        {TABS.map(t=>(
+          <TouchableOpacity key={t.id} onPress={()=>setActiveTab(t.id)} style={{flex:1,paddingVertical:10,alignItems:'center',borderBottomWidth:2,borderBottomColor:activeTab===t.id?C.accent:'transparent'}}>
+            <Text style={{color:activeTab===t.id?C.accent:C.t2,fontSize:12,fontWeight:'600'}}>{t.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {/* CONTENT */}
+      <View style={{flex:1}}>
+        {activeTab==='dashboard' && <DashboardTab tickers={tickers} tickerData={tickerData} onAddTicker={()=>setTickerModal(true)} onRemoveTicker={removeTicker} activeCF={activeCF} onToggleCF={toggleCF}/>}
+        {activeTab==='picks' && <PicksTab recs={recs} tickerData={tickerData} onAdd={openAddRec} onEdit={openEditRec} onDelete={deleteRec}/>}
+        {activeTab==='portfolio' && <PortfolioTab portfolio={portfolio} tickerData={tickerData} onAdd={()=>setPosModal(true)} onRemove={removePosition}/>}
+        {activeTab==='ai' && <AITab activeCF={activeCF} recs={recs} portfolio={portfolio}/>}
+      </View>
+
+      {/* ADD TICKER MODAL */}
+      <AppModal visible={tickerModal} title="Add ticker" onClose={()=>setTickerModal(false)}>
+        <Inp placeholder="Symbol (e.g. AAPL)" value={newTickerSym} onChangeText={v=>setNewTickerSym(v.toUpperCase())} autoCapitalize="characters"/>
+        <BtnPrimary title="Add ticker" onPress={addTicker}/>
+      </AppModal>
+
+      {/* REC MODAL */}
+      <AppModal visible={recModal} title={editingRec?'Edit recommendation':'Add recommendation'} onClose={()=>setRecModal(false)}>
+        <View style={{flexDirection:'row',gap:8}}>
+          <Inp placeholder="Symbol" value={recForm.sym} onChangeText={v=>setRecForm(p=>({...p,sym:v.toUpperCase()}))} style={{flex:1}} autoCapitalize="characters"/>
+          <Inp placeholder="Company name" value={recForm.name} onChangeText={v=>setRecForm(p=>({...p,name:v}))} style={{flex:2}}/>
+        </View>
+        <View style={{flexDirection:'row',gap:8,marginBottom:10}}>
+          {['BUY','SELL','WATCH'].map(a=>(
+            <TouchableOpacity key={a} onPress={()=>setRecForm(p=>({...p,action:a}))}
+              style={{flex:1,padding:10,borderRadius:10,borderWidth:1,alignItems:'center',
+                borderColor:recForm.action===a?C.accent:C.border,
+                backgroundColor:recForm.action===a?'rgba(0,229,160,.1)':C.bg2}}>
+              <Text style={{color:recForm.action===a?C.accent:C.t2,fontSize:12,fontWeight:'600'}}>{a}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+        <Inp placeholder="Price target (e.g. $185)" value={recForm.target} onChangeText={v=>setRecForm(p=>({...p,target:v}))}/>
+        <Inp placeholder="Reason / analysis..." value={recForm.reason} onChangeText={v=>setRecForm(p=>({...p,reason:v}))} multiline numberOfLines={3} style={{height:80,textAlignVertical:'top'}}/>
+        <BtnPrimary title="Save" onPress={saveRec}/>
+      </AppModal>
+
+      {/* POSITION MODAL */}
+      <AppModal visible={posModal} title="Add position" onClose={()=>setPosModal(false)}>
+        <Inp placeholder="Symbol (e.g. NVDA)" value={posForm.sym} onChangeText={v=>setPosForm(p=>({...p,sym:v.toUpperCase()}))} autoCapitalize="characters"/>
+        <View style={{flexDirection:'row',gap:8}}>
+          <Inp placeholder="Shares" value={posForm.shares} onChangeText={v=>setPosForm(p=>({...p,shares:v}))} keyboardType="decimal-pad" style={{flex:1}}/>
+          <Inp placeholder="Buy price ($)" value={posForm.buyPrice} onChangeText={v=>setPosForm(p=>({...p,buyPrice:v}))} keyboardType="decimal-pad" style={{flex:1}}/>
+        </View>
+        <BtnPrimary title="Add position" onPress={addPosition}/>
+      </AppModal>
+    </SafeAreaView>
+  );
+}
+
+const s = StyleSheet.create({
+  scroll:{flex:1,paddingHorizontal:12,paddingTop:10},
+  recBtn:{paddingHorizontal:12,paddingVertical:5,borderRadius:8,borderWidth:1,borderColor:C.border,backgroundColor:C.bg2},
+  disclaimer:{color:C.t3,fontSize:9,textAlign:'center',paddingVertical:12,lineHeight:14},
+});
